@@ -10,6 +10,7 @@ authors = ["Sean McArthur <sean@seanmonstar.com>", "Tricster <mediosrity@gmail.c
 keywords = ["http", "hyper", "hyperium", "wasi"]
 categories = ["network-programming", "web-programming::http-client", "web-programming::http-server"]
 edition = "2018"
+rust-version = "1.56"
 
 
 [lib]
