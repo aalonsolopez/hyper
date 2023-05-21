@@ -16,7 +16,7 @@ Note: We do not yet support SSL / TLS connections in hyper_wasi yet.
 - Extensive production use
 - Client and Server APIs
 
-**Get started** by looking over the [guides](https://hyper.rs/guides).
+**Get started** by looking over the [guides](https://hyper.rs/guides/1/).
 
 ## Contributing
 
