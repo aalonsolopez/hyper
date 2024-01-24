@@ -26,7 +26,6 @@ use std::task::{self, Poll};
 use std::time::{Duration, Instant};
 
 use h2::{Ping, PingPong};
-use tracing::{debug, trace};
 
 use crate::common::time::Time;
 use crate::rt::Sleep;
@@ -265,7 +264,7 @@ impl Ponger {
 
         if let Some(ref mut ka) = self.keep_alive {
             ka.maybe_schedule(is_idle, &locked);
-            ka.maybe_ping(cx, &mut locked);
+            ka.maybe_ping(cx, is_idle, &mut locked);
         }
 
         if !locked.is_ping_sent() {
@@ -285,7 +284,7 @@ impl Ponger {
                 if let Some(ref mut ka) = self.keep_alive {
                     locked.update_last_read_at();
                     ka.maybe_schedule(is_idle, &locked);
-                    ka.maybe_ping(cx, &mut locked);
+                    ka.maybe_ping(cx, is_idle, &mut locked);
                 }
 
                 if let Some(ref mut bdp) = self.bdp {
@@ -300,8 +299,8 @@ impl Ponger {
                     }
                 }
             }
-            Poll::Ready(Err(e)) => {
-                debug!("pong error: {}", e);
+            Poll::Ready(Err(_e)) => {
+                debug!("pong error: {}", _e);
             }
             Poll::Pending => {
                 if let Some(ref mut ka) = self.keep_alive {
@@ -332,8 +331,8 @@ impl Shared {
                 self.ping_sent_at = Some(Instant::now());
                 trace!("sent ping");
             }
-            Err(err) => {
-                debug!("error sending ping: {}", err);
+            Err(_err) => {
+                debug!("error sending ping: {}", _err);
             }
         }
     }
@@ -449,7 +448,7 @@ impl KeepAlive {
         self.timer.reset(&mut self.sleep, interval);
     }
 
-    fn maybe_ping(&mut self, cx: &mut task::Context<'_>, shared: &mut Shared) {
+    fn maybe_ping(&mut self, cx: &mut task::Context<'_>, is_idle: bool, shared: &mut Shared) {
         match self.state {
             KeepAliveState::Scheduled(at) => {
                 if Pin::new(&mut self.sleep).poll(cx).is_pending() {
@@ -459,6 +458,10 @@ impl KeepAlive {
                 if shared.last_read_at() + self.interval > at {
                     self.state = KeepAliveState::Init;
                     cx.waker().wake_by_ref(); // schedule us again
+                    return;
+                }
+                if !self.while_idle && is_idle {
+                    trace!("keep-alive no need to ping when idle and while_idle=false");
                     return;
                 }
                 trace!("keep-alive interval ({:?}) reached", self.interval);

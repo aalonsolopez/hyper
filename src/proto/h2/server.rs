@@ -1,6 +1,8 @@
 use std::error::Error as StdError;
+use std::future::Future;
 use std::marker::Unpin;
-
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -8,23 +10,23 @@ use h2::server::{Connection, Handshake, SendResponse};
 use h2::{Reason, RecvStream};
 use http::{Method, Request};
 use pin_project_lite::pin_project;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, trace, warn};
 
 use super::{ping, PipeToSendStream, SendBuf};
 use crate::body::{Body, Incoming as IncomingBody};
-use crate::common::exec::ConnStreamExec;
+use crate::common::date;
+use crate::common::io::Compat;
 use crate::common::time::Time;
-use crate::common::{date, task, Future, Pin, Poll};
 use crate::ext::Protocol;
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::h2::{H2Upgraded, UpgradedSendStream};
 use crate::proto::Dispatched;
+use crate::rt::bounds::Http2ServerConnExec;
+use crate::rt::{Read, Write};
 use crate::service::HttpService;
 
 use crate::upgrade::{OnUpgrade, Pending, Upgraded};
-use crate::{Response};
+use crate::Response;
 
 // Our defaults are chosen for the "majority" case, which usually are not
 // resource constrained, and so the spec default of 64kb can be too limiting
@@ -61,7 +63,7 @@ impl Default for Config {
             initial_stream_window_size: DEFAULT_STREAM_WINDOW,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             enable_connect_protocol: false,
-            max_concurrent_streams: None,
+            max_concurrent_streams: Some(200),
             keep_alive_interval: None,
             keep_alive_timeout: Duration::from_secs(20),
             max_send_buffer_size: DEFAULT_MAX_SEND_BUF_SIZE,
@@ -89,7 +91,7 @@ where
 {
     Handshaking {
         ping_config: ping::Config,
-        hs: Handshake<T, SendBuf<B::Data>>,
+        hs: Handshake<Compat<T>, SendBuf<B::Data>>,
     },
     Serving(Serving<T, B>),
     Closed,
@@ -100,17 +102,17 @@ where
     B: Body,
 {
     ping: Option<(ping::Recorder, ping::Ponger)>,
-    conn: Connection<T, SendBuf<B::Data>>,
+    conn: Connection<Compat<T>, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     S: HttpService<IncomingBody, ResBody = B>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     B: Body + 'static,
-    E: ConnStreamExec<S::Future, B>,
+    E: Http2ServerConnExec<S::Future, B>,
 {
     pub(crate) fn new(
         io: T,
@@ -132,7 +134,7 @@ where
         if config.enable_connect_protocol {
             builder.enable_connect_protocol();
         }
-        let handshake = builder.handshake(io);
+        let handshake = builder.handshake(Compat::new(io));
 
         let bdp = if config.adaptive_window {
             Some(config.initial_stream_window_size)
@@ -182,15 +184,15 @@ where
 
 impl<T, S, B, E> Future for Server<T, S, B, E>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     S: HttpService<IncomingBody, ResBody = B>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     B: Body + 'static,
-    E: ConnStreamExec<S::Future, B>,
+    E: Http2ServerConnExec<S::Future, B>,
 {
     type Output = crate::Result<Dispatched>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = &mut *self;
         loop {
             let next = match me.state {
@@ -228,19 +230,19 @@ where
 
 impl<T, B> Serving<T, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: Read + Write + Unpin,
     B: Body + 'static,
 {
     fn poll_server<S, E>(
         &mut self,
-        cx: &mut task::Context<'_>,
+        cx: &mut Context<'_>,
         service: &mut S,
         exec: &mut E,
     ) -> Poll<crate::Result<()>>
     where
         S: HttpService<IncomingBody, ResBody = B>,
         S::Error: Into<Box<dyn StdError + Send + Sync>>,
-        E: ConnStreamExec<S::Future, B>,
+        E: Http2ServerConnExec<S::Future, B>,
     {
         if self.closing.is_none() {
             loop {
@@ -321,7 +323,7 @@ where
         Poll::Ready(Err(self.closing.take().expect("polled after error")))
     }
 
-    fn poll_ping(&mut self, cx: &mut task::Context<'_>) {
+    fn poll_ping(&mut self, cx: &mut Context<'_>) {
         if let Some((_, ref mut estimator)) = self.ping {
             match estimator.poll(cx) {
                 Poll::Ready(ping::Ponged::SizeUpdate(wnd)) => {
@@ -411,7 +413,7 @@ where
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: Into<Box<dyn StdError + Send + Sync>>,
 {
-    fn poll2(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+    fn poll2(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         let mut me = self.project();
         loop {
             let next = match me.state.as_mut().project() {
@@ -506,10 +508,10 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.poll2(cx).map(|res| {
-            if let Err(e) = res {
-                debug!("stream error: {}", e);
+            if let Err(_e) = res {
+                debug!("stream error: {}", _e);
             }
         })
     }

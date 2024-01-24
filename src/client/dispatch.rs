@@ -1,11 +1,17 @@
+use std::task::{Context, Poll};
 #[cfg(feature = "http2")]
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
+#[cfg(feature = "http2")]
+use http::{Request, Response};
+#[cfg(feature = "http2")]
+use http_body::Body;
+#[cfg(feature = "http2")]
+use pin_project_lite::pin_project;
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "http2")]
-use crate::common::Pin;
-use crate::common::{task, Poll};
+use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
 
 #[cfg(test)]
 pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, (crate::Error, Option<T>)>>;
@@ -15,6 +21,7 @@ pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (giver, taker) = want::new();
     let tx = Sender {
+        #[cfg(feature = "http1")]
         buffered_once: false,
         giver,
         inner: tx,
@@ -31,6 +38,7 @@ pub(crate) struct Sender<T, U> {
     /// One message is always allowed, even if the Receiver hasn't asked
     /// for it yet. This boolean keeps track of whether we've sent one
     /// without notice.
+    #[cfg(feature = "http1")]
     buffered_once: bool,
     /// The Giver helps watch that the the Receiver side has been polled
     /// when the queue is empty. This helps us know when a request and
@@ -53,23 +61,24 @@ pub(crate) struct UnboundedSender<T, U> {
 }
 
 impl<T, U> Sender<T, U> {
-    pub(crate) fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+    #[cfg(feature = "http1")]
+    pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         self.giver
             .poll_want(cx)
             .map_err(|_| crate::Error::new_closed())
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "http1")]
     pub(crate) fn is_ready(&self) -> bool {
         self.giver.is_wanting()
     }
 
-    /*
+    #[cfg(feature = "http1")]
     pub(crate) fn is_closed(&self) -> bool {
         self.giver.is_canceled()
     }
-    */
 
+    #[cfg(feature = "http1")]
     fn can_send(&mut self) -> bool {
         if self.giver.give() || !self.buffered_once {
             // If the receiver is ready *now*, then of course we can send.
@@ -95,6 +104,7 @@ impl<T, U> Sender<T, U> {
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
 
+    #[cfg(feature = "http1")]
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
         if !self.can_send() {
             return Err(val);
@@ -117,11 +127,9 @@ impl<T, U> Sender<T, U> {
 
 #[cfg(feature = "http2")]
 impl<T, U> UnboundedSender<T, U> {
-    /*
     pub(crate) fn is_ready(&self) -> bool {
         !self.giver.is_canceled()
     }
-    */
 
     pub(crate) fn is_closed(&self) -> bool {
         self.giver.is_canceled()
@@ -161,10 +169,7 @@ pub(crate) struct Receiver<T, U> {
 }
 
 impl<T, U> Receiver<T, U> {
-    pub(crate) fn poll_recv(
-        &mut self,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Option<(T, Callback<T, U>)>> {
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
         match self.inner.poll_recv(cx) {
             Poll::Ready(item) => {
                 Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
@@ -253,7 +258,7 @@ impl<T, U> Callback<T, U> {
         }
     }
 
-    pub(crate) fn poll_canceled(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
+    pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match *self {
             Callback::Retry(Some(ref mut tx)) => tx.poll_closed(cx),
             Callback::NoRetry(Some(ref mut tx)) => tx.poll_closed(cx),
@@ -271,37 +276,57 @@ impl<T, U> Callback<T, U> {
             }
         }
     }
+}
 
-    #[cfg(feature = "http2")]
-    pub(crate) async fn send_when(
-        self,
-        mut when: impl Future<Output = Result<U, (crate::Error, Option<T>)>> + Unpin,
-    ) {
-        use futures_util::future;
-        use tracing::trace;
+#[cfg(feature = "http2")]
+pin_project! {
+    pub struct SendWhen<B>
+    where
+        B: Body,
+        B: 'static,
+    {
+        #[pin]
+        pub(crate) when: ResponseFutMap<B>,
+        #[pin]
+        pub(crate) call_back: Option<Callback<Request<B>, Response<Incoming>>>,
+    }
+}
 
-        let mut cb = Some(self);
+#[cfg(feature = "http2")]
+impl<B> Future for SendWhen<B>
+where
+    B: Body + 'static,
+{
+    type Output = ();
 
-        // "select" on this callback being canceled, and the future completing
-        future::poll_fn(move |cx| {
-            match Pin::new(&mut when).poll(cx) {
-                Poll::Ready(Ok(res)) => {
-                    cb.take().expect("polled after complete").send(Ok(res));
-                    Poll::Ready(())
-                }
-                Poll::Pending => {
-                    // check if the callback is canceled
-                    ready!(cb.as_mut().unwrap().poll_canceled(cx));
-                    trace!("send_when canceled");
-                    Poll::Ready(())
-                }
-                Poll::Ready(Err(err)) => {
-                    cb.take().expect("polled after complete").send(Err(err));
-                    Poll::Ready(())
-                }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+
+        let mut call_back = this.call_back.take().expect("polled after complete");
+
+        match Pin::new(&mut this.when).poll(cx) {
+            Poll::Ready(Ok(res)) => {
+                call_back.send(Ok(res));
+                Poll::Ready(())
             }
-        })
-        .await
+            Poll::Pending => {
+                // check if the callback is canceled
+                match call_back.poll_canceled(cx) {
+                    Poll::Ready(v) => v,
+                    Poll::Pending => {
+                        // Move call_back back to struct before return
+                        this.call_back.set(Some(call_back));
+                        return Poll::Pending;
+                    }
+                };
+                trace!("send_when canceled");
+                Poll::Ready(())
+            }
+            Poll::Ready(Err(err)) => {
+                call_back.send(Err(err));
+                Poll::Ready(())
+            }
+        }
     }
 }
 

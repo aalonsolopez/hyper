@@ -1,18 +1,19 @@
+use std::error::Error as StdError;
+use std::future::Future;
+use std::io::{Cursor, IoSlice};
+use std::mem;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::{Buf, Bytes};
 use h2::{Reason, RecvStream, SendStream};
 use http::header::{HeaderName, CONNECTION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE};
 use http::HeaderMap;
 use pin_project_lite::pin_project;
-use std::error::Error as StdError;
-use std::io::{self, Cursor, IoSlice};
-use std::mem;
-use std::task::Context;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, trace, warn};
 
 use crate::body::Body;
-use crate::common::{task, Future, Pin, Poll};
 use crate::proto::h2::ping::Recorder;
+use crate::rt::{Read, ReadBufCursor, Write};
 
 pub(crate) mod ping;
 
@@ -29,21 +30,21 @@ cfg_server! {
 /// Default initial stream window size defined in HTTP2 spec.
 pub(crate) const SPEC_WINDOW_SIZE: u32 = 65_535;
 
-fn strip_connection_headers(headers: &mut HeaderMap, is_request: bool) {
-    // List of connection headers from:
-    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection
-    //
-    // TE headers are allowed in HTTP/2 requests as long as the value is "trailers", so they're
-    // tested separately.
-    let connection_headers = [
-        HeaderName::from_lowercase(b"keep-alive").unwrap(),
-        HeaderName::from_lowercase(b"proxy-connection").unwrap(),
-        TRAILER,
-        TRANSFER_ENCODING,
-        UPGRADE,
-    ];
+// List of connection headers from:
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection
+//
+// TE headers are allowed in HTTP/2 requests as long as the value is "trailers", so they're
+// tested separately.
+const CONNECTION_HEADERS: [HeaderName; 5] = [
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
+    TRAILER,
+    TRANSFER_ENCODING,
+    UPGRADE,
+];
 
-    for header in connection_headers.iter() {
+fn strip_connection_headers(headers: &mut HeaderMap, is_request: bool) {
+    for header in &CONNECTION_HEADERS {
         if headers.remove(header).is_some() {
             warn!("Connection header illegal in HTTP/2: {}", header.as_str());
         }
@@ -85,7 +86,7 @@ fn strip_connection_headers(headers: &mut HeaderMap, is_request: bool) {
 // body adapters used by both Client and Server
 
 pin_project! {
-    struct PipeToSendStream<S>
+    pub(crate) struct PipeToSendStream<S>
     where
         S: Body,
     {
@@ -116,7 +117,7 @@ where
 {
     type Output = crate::Result<()>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
         loop {
             // we don't have the next chunk of data yet, so just reserve 1 byte to make
@@ -129,9 +130,7 @@ where
                     match ready!(me.body_tx.poll_capacity(cx)) {
                         Some(Ok(0)) => {}
                         Some(Ok(_)) => break,
-                        Some(Err(e)) => {
-                            return Poll::Ready(Err(crate::Error::new_body_write(e)))
-                        }
+                        Some(Err(e)) => return Poll::Ready(Err(crate::Error::new_body_write(e))),
                         None => {
                             // None means the stream is no longer in a
                             // streaming state, we either finished it
@@ -148,9 +147,7 @@ where
                 .map_err(crate::Error::new_body_write)?
             {
                 debug!("stream received RST_STREAM: {:?}", reason);
-                return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(
-                    reason,
-                ))));
+                return Poll::Ready(Err(crate::Error::new_body_write(::h2::Error::from(reason))));
             }
 
             match ready!(me.stream.as_mut().poll_frame(cx)) {
@@ -275,15 +272,15 @@ where
     buf: Bytes,
 }
 
-impl<B> AsyncRead for H2Upgraded<B>
+impl<B> Read for H2Upgraded<B>
 where
     B: Buf,
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        read_buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+        mut read_buf: ReadBufCursor<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         if self.buf.is_empty() {
             self.buf = loop {
                 match ready!(self.recv_stream.poll_data(cx)) {
@@ -299,7 +296,7 @@ where
                         return Poll::Ready(match e.reason() {
                             Some(Reason::NO_ERROR) | Some(Reason::CANCEL) => Ok(()),
                             Some(Reason::STREAM_CLOSED) => {
-                                Err(io::Error::new(io::ErrorKind::BrokenPipe, e))
+                                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
                             }
                             _ => Err(h2_to_io_error(e)),
                         })
@@ -315,7 +312,7 @@ where
     }
 }
 
-impl<B> AsyncWrite for H2Upgraded<B>
+impl<B> Write for H2Upgraded<B>
 where
     B: Buf,
 {
@@ -323,7 +320,7 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
+    ) -> Poll<Result<usize, std::io::Error>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -348,7 +345,7 @@ where
         Poll::Ready(Err(h2_to_io_error(
             match ready!(self.send_stream.poll_reset(cx)) {
                 Ok(Reason::NO_ERROR) | Ok(Reason::CANCEL) | Ok(Reason::STREAM_CLOSED) => {
-                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
                 }
                 Ok(reason) => reason.into(),
                 Err(e) => e,
@@ -356,25 +353,23 @@ where
         )))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    ) -> Poll<Result<(), std::io::Error>> {
         if self.send_stream.write(&[], true).is_ok() {
-            return Poll::Ready(Ok(()))
+            return Poll::Ready(Ok(()));
         }
 
         Poll::Ready(Err(h2_to_io_error(
             match ready!(self.send_stream.poll_reset(cx)) {
-                Ok(Reason::NO_ERROR) => {
-                    return Poll::Ready(Ok(()))
-                }
+                Ok(Reason::NO_ERROR) => return Poll::Ready(Ok(())),
                 Ok(Reason::CANCEL) | Ok(Reason::STREAM_CLOSED) => {
-                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
                 }
                 Ok(reason) => reason.into(),
                 Err(e) => e,
@@ -383,11 +378,11 @@ where
     }
 }
 
-fn h2_to_io_error(e: h2::Error) -> io::Error {
+fn h2_to_io_error(e: h2::Error) -> std::io::Error {
     if e.is_io() {
         e.into_io().unwrap()
     } else {
-        io::Error::new(io::ErrorKind::Other, e)
+        std::io::Error::new(std::io::ErrorKind::Other, e)
     }
 }
 
@@ -414,7 +409,7 @@ where
         unsafe { self.as_inner_unchecked().poll_reset(cx) }
     }
 
-    fn write(&mut self, buf: &[u8], end_of_stream: bool) -> Result<(), io::Error> {
+    fn write(&mut self, buf: &[u8], end_of_stream: bool) -> Result<(), std::io::Error> {
         let send_buf = SendBuf::Cursor(Cursor::new(buf.into()));
         unsafe {
             self.as_inner_unchecked()

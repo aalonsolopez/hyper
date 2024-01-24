@@ -17,11 +17,14 @@ use hyper::{body::Incoming as IncomingBody, Request, Response, Version};
 pub use futures_util::{
     future, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
 };
-pub use hyper::{HeaderMap, StatusCode};
+pub use hyper::HeaderMap;
 pub use std::net::SocketAddr;
 
 mod tokiort;
-pub use tokiort::{TokioExecutor, TokioTimer};
+#[allow(unused)]
+pub use tokiort::{TokioExecutor, TokioIo, TokioTimer};
+
+pub mod trailers;
 
 #[allow(unused_macros)]
 macro_rules! t {
@@ -199,7 +202,7 @@ macro_rules! __internal_req_res_prop {
         $prop_val
     };
     (status: $prop_val:expr) => {
-        StatusCode::from_u16($prop_val).expect("status code")
+        hyper::StatusCode::from_u16($prop_val).expect("status code")
     };
     ($prop_name:ident: $prop_val:expr) => {
         From::from($prop_val)
@@ -357,6 +360,7 @@ async fn async_test(cfg: __TestConfig) {
 
         loop {
             let (stream, _) = listener.accept().await.expect("server error");
+            let io = TokioIo::new(stream);
 
             // Move a clone into the service_fn
             let serve_handles = serve_handles.clone();
@@ -386,12 +390,12 @@ async fn async_test(cfg: __TestConfig) {
             tokio::task::spawn(async move {
                 if http2_only {
                     server::conn::http2::Builder::new(TokioExecutor)
-                        .serve_connection(stream, service)
+                        .serve_connection(io, service)
                         .await
                         .expect("server error");
                 } else {
                     server::conn::http1::Builder::new()
-                        .serve_connection(stream, service)
+                        .serve_connection(io, service)
                         .await
                         .expect("server error");
                 }
@@ -425,11 +429,11 @@ async fn async_test(cfg: __TestConfig) {
 
         async move {
             let stream = TcpStream::connect(addr).await.unwrap();
+            let io = TokioIo::new(stream);
 
             let res = if http2_only {
-                let (mut sender, conn) = hyper::client::conn::http2::Builder::new()
-                    .executor(TokioExecutor)
-                    .handshake(stream)
+                let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor)
+                    .handshake(io)
                     .await
                     .unwrap();
 
@@ -441,7 +445,7 @@ async fn async_test(cfg: __TestConfig) {
                 sender.send_request(req).await.unwrap()
             } else {
                 let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-                    .handshake(stream)
+                    .handshake(io)
                     .await
                     .unwrap();
 
@@ -509,6 +513,7 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
 
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
 
                 let service = service_fn(move |mut req| {
                     async move {
@@ -524,13 +529,14 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
                         let stream = TcpStream::connect(format!("{}:{}", uri, port))
                             .await
                             .unwrap();
+                        let io = TokioIo::new(stream);
 
                         let resp = if http2_only {
-                            let (mut sender, conn) = hyper::client::conn::http2::Builder::new()
-                                .executor(TokioExecutor)
-                                .handshake(stream)
-                                .await
-                                .unwrap();
+                            let (mut sender, conn) =
+                                hyper::client::conn::http2::Builder::new(TokioExecutor)
+                                    .handshake(io)
+                                    .await
+                                    .unwrap();
 
                             tokio::task::spawn(async move {
                                 if let Err(err) = conn.await {
@@ -541,7 +547,7 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
                             sender.send_request(req).await?
                         } else {
                             let builder = hyper::client::conn::http1::Builder::new();
-                            let (mut sender, conn) = builder.handshake(stream).await.unwrap();
+                            let (mut sender, conn) = builder.handshake(io).await.unwrap();
 
                             tokio::task::spawn(async move {
                                 if let Err(err) = conn.await {
@@ -570,12 +576,12 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
 
                 if http2_only {
                     server::conn::http2::Builder::new(TokioExecutor)
-                        .serve_connection(stream, service)
+                        .serve_connection(io, service)
                         .await
                         .unwrap();
                 } else {
                     server::conn::http1::Builder::new()
-                        .serve_connection(stream, service)
+                        .serve_connection(io, service)
                         .await
                         .unwrap();
                 }

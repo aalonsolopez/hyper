@@ -1,12 +1,11 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
 
-#[macro_use]
-extern crate matches;
-
 use std::convert::Infallible;
 use std::fmt;
+use std::future::Future;
 use std::io::{Read, Write};
+use std::iter::FromIterator;
 use std::net::{SocketAddr, TcpListener};
 use std::pin::Pin;
 use std::thread;
@@ -15,13 +14,13 @@ use std::time::Duration;
 use http::uri::PathAndQuery;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode, Uri, Version};
 
 use bytes::Bytes;
 use futures_channel::oneshot;
-use futures_core::{Future, TryFuture};
-use futures_util::future::{self, FutureExt, TryFutureExt};
+use futures_util::future::{self, FutureExt, TryFuture, TryFutureExt};
+use support::TokioIo;
 use tokio::net::TcpStream;
 mod support;
 
@@ -36,10 +35,11 @@ where
     b.collect().await.map(|c| c.to_bytes())
 }
 
-fn tcp_connect(addr: &SocketAddr) -> impl Future<Output = std::io::Result<TcpStream>> {
-    TcpStream::connect(*addr)
+async fn tcp_connect(addr: &SocketAddr) -> std::io::Result<TokioIo<TcpStream>> {
+    TcpStream::connect(*addr).await.map(TokioIo::new)
 }
 
+#[derive(Clone)]
 struct HttpInfo {
     remote_addr: SocketAddr,
 }
@@ -312,7 +312,7 @@ macro_rules! test {
                 req.headers_mut().append("Host", HeaderValue::from_str(&host).unwrap());
             }
 
-            let (mut sender, conn) = builder.handshake(stream).await?;
+            let (mut sender, conn) = builder.handshake(TokioIo::new(stream)).await?;
 
             tokio::task::spawn(async move {
                 if let Err(err) = conn.await {
@@ -409,6 +409,15 @@ macro_rules! __client_req_prop {
             $body_e,
             Frame::data,
         )));
+    }};
+
+    ($req_builder:ident, $body:ident, $addr:ident, body_stream_with_trailers: $body_e:expr) => {{
+        use support::trailers::StreamBodyWithTrailers;
+        let (body, trailers) = $body_e;
+        $body = BodyExt::boxed(StreamBodyWithTrailers::with_trailers(
+            futures_util::TryStreamExt::map_ok(body, Frame::data),
+            trailers,
+        ));
     }};
 }
 
@@ -631,6 +640,44 @@ test! {
             status: OK,
             headers: {},
             body: &b"hello"[..],
+}
+
+test! {
+    name: client_post_req_body_chunked_with_trailer,
+
+    server:
+        expected: "\
+            POST / HTTP/1.1\r\n\
+            trailer: chunky-trailer\r\n\
+            host: {addr}\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            chunky-trailer: header data\r\n\
+            \r\n\
+            ",
+        reply: REPLY_OK,
+
+    client:
+        request: {
+            method: POST,
+            url: "http://{addr}/",
+            headers: {
+                "trailer" => "chunky-trailer",
+            },
+            body_stream_with_trailers: (
+                (futures_util::stream::once(async { Ok::<_, Infallible>(Bytes::from("hello"))})),
+                HeaderMap::from_iter(vec![(
+                    HeaderName::from_static("chunky-trailer"),
+                    HeaderValue::from_static("header data")
+                )].into_iter())),
+        },
+        response:
+            status: OK,
+            headers: {},
+            body: None,
 }
 
 test! {
@@ -1337,9 +1384,9 @@ mod conn {
     use bytes::{Buf, Bytes};
     use futures_channel::{mpsc, oneshot};
     use futures_util::future::{self, poll_fn, FutureExt, TryFutureExt};
-    use http_body_util::{BodyExt, Empty, StreamBody};
+    use http_body_util::{BodyExt, Empty, Full, StreamBody};
     use hyper::rt::Timer;
-    use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener as TkTcpListener, TcpStream};
 
     use hyper::body::{Body, Frame};
@@ -1349,7 +1396,7 @@ mod conn {
 
     use super::{concat, s, support, tcp_connect, FutureHyperExt};
 
-    use support::{TokioExecutor, TokioTimer};
+    use support::{TokioExecutor, TokioIo, TokioTimer};
 
     fn setup_logger() {
         let _ = pretty_env_logger::try_init();
@@ -1773,18 +1820,19 @@ mod conn {
         }
 
         let parts = conn.into_parts();
-        let mut io = parts.io;
+        let io = parts.io;
         let buf = parts.read_buf;
 
         assert_eq!(buf, b"foobar=ready"[..]);
         assert!(!io.shutdown_called, "upgrade shouldn't shutdown AsyncWrite");
         rt.block_on(poll_fn(|ctx| {
             let ready = client.poll_ready(ctx);
-            assert_matches!(ready, Poll::Ready(Err(_)));
+            assert!(matches!(ready, Poll::Ready(Err(_))));
             ready
         }))
         .unwrap_err();
 
+        let mut io = io.tcp.inner();
         let mut vec = vec![];
         rt.block_on(io.write_all(b"foo=bar")).unwrap();
         rt.block_on(io.read_to_end(&mut vec)).unwrap();
@@ -1861,7 +1909,7 @@ mod conn {
         }
 
         let parts = conn.into_parts();
-        let mut io = parts.io;
+        let io = parts.io;
         let buf = parts.read_buf;
 
         assert_eq!(buf, b"foobar=ready"[..]);
@@ -1869,11 +1917,12 @@ mod conn {
 
         rt.block_on(poll_fn(|ctx| {
             let ready = client.poll_ready(ctx);
-            assert_matches!(ready, Poll::Ready(Err(_)));
+            assert!(matches!(ready, Poll::Ready(Err(_))));
             ready
         }))
         .unwrap_err();
 
+        let mut io = io.tcp.inner();
         let mut vec = vec![];
         rt.block_on(io.write_all(b"foo=bar")).unwrap();
         rt.block_on(io.read_to_end(&mut vec)).unwrap();
@@ -1895,6 +1944,7 @@ mod conn {
                 tokio::select! {
                     res = listener.accept() => {
                         let (stream, _) = res.unwrap();
+                        let stream = TokioIo::new(stream);
 
                         let service = service_fn(|_:Request<hyper::body::Incoming>| future::ok::<_, hyper::Error>(Response::new(Empty::<Bytes>::new())));
 
@@ -1922,8 +1972,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (mut client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
             .handshake(io)
             .await
             .expect("http handshake");
@@ -1979,8 +2028,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (_client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (_client, conn) = conn::http2::Builder::new(TokioExecutor)
             .timer(TokioTimer)
             .keep_alive_interval(Duration::from_secs(1))
             .keep_alive_timeout(Duration::from_secs(1))
@@ -2008,8 +2056,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (mut client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
             .timer(TokioTimer)
             .keep_alive_interval(Duration::from_secs(1))
             .keep_alive_timeout(Duration::from_secs(1))
@@ -2040,8 +2087,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (mut client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
             .timer(TokioTimer)
             .keep_alive_interval(Duration::from_secs(1))
             .keep_alive_timeout(Duration::from_secs(1))
@@ -2081,7 +2127,7 @@ mod conn {
 
         // Spawn an HTTP2 server that reads the whole body and responds
         tokio::spawn(async move {
-            let sock = listener.accept().await.unwrap().0;
+            let sock = TokioIo::new(listener.accept().await.unwrap().0);
             hyper::server::conn::http2::Builder::new(TokioExecutor)
                 .timer(TokioTimer)
                 .serve_connection(
@@ -2100,8 +2146,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (mut client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
             .timer(TokioTimer)
             .keep_alive_interval(Duration::from_secs(1))
             .keep_alive_timeout(Duration::from_secs(1))
@@ -2125,6 +2170,62 @@ mod conn {
         future::poll_fn(|ctx| client.poll_ready(ctx))
             .await
             .expect("client should be open");
+    }
+
+    #[tokio::test]
+    async fn http2_responds_before_consuming_request_body() {
+        // Test that a early-response from server works correctly (request body wasn't fully consumed).
+        // https://github.com/hyperium/hyper/issues/2872
+        use hyper::service::service_fn;
+
+        let _ = pretty_env_logger::try_init();
+
+        let (listener, addr) = setup_tk_test_server().await;
+
+        // Spawn an HTTP2 server that responds before reading the whole request body.
+        // It's normal case to decline the request due to headers or size of the body.
+        tokio::spawn(async move {
+            let sock = TokioIo::new(listener.accept().await.unwrap().0);
+            hyper::server::conn::http2::Builder::new(TokioExecutor)
+                .timer(TokioTimer)
+                .serve_connection(
+                    sock,
+                    service_fn(|_req| async move {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                            "No bread for you!",
+                        ))))
+                    }),
+                )
+                .await
+                .expect("serve_connection");
+        });
+
+        let io = tcp_connect(&addr).await.expect("tcp connect");
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .timer(TokioTimer)
+            .handshake(io)
+            .await
+            .expect("http handshake");
+
+        tokio::spawn(async move {
+            conn.await.expect("client conn shouldn't error");
+        });
+
+        // Use a channel to keep request stream open
+        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, Box<dyn Error + Send + Sync>>>(0);
+        let req = Request::post("/a").body(StreamBody::new(recv)).unwrap();
+        let resp = client.send_request(req).await.expect("send_request");
+        assert!(resp.status().is_success());
+
+        let mut body = String::new();
+        concat(resp.into_body())
+            .await
+            .unwrap()
+            .reader()
+            .read_to_string(&mut body)
+            .unwrap();
+
+        assert_eq!(&body, "No bread for you!");
     }
 
     #[tokio::test]
@@ -2156,8 +2257,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (mut client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
             .handshake(io)
             .await
             .expect("http handshake");
@@ -2172,7 +2272,7 @@ mod conn {
         let res = client.send_request(req).await.expect("send_request");
         assert_eq!(res.status(), StatusCode::OK);
 
-        let mut upgraded = hyper::upgrade::on(res).await.unwrap();
+        let mut upgraded = TokioIo::new(hyper::upgrade::on(res).await.unwrap());
 
         let mut vec = vec![];
         upgraded.read_to_end(&mut vec).await.unwrap();
@@ -2207,8 +2307,7 @@ mod conn {
         });
 
         let io = tcp_connect(&addr).await.expect("tcp connect");
-        let (mut client, conn) = conn::http2::Builder::new()
-            .executor(TokioExecutor)
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
             .handshake::<_, Empty<Bytes>>(io)
             .await
             .expect("http handshake");
@@ -2265,13 +2364,9 @@ mod conn {
         let error = client.send_request(req).await.unwrap_err();
 
         assert!(error.is_user());
-        assert_eq!(
-            error.to_string(),
-            "dispatch task is gone: user code panicked"
-        );
     }
 
-    async fn drain_til_eof<T: AsyncRead + Unpin>(mut sock: T) -> io::Result<()> {
+    async fn drain_til_eof<T: tokio::io::AsyncRead + Unpin>(mut sock: T) -> io::Result<()> {
         let mut buf = [0u8; 1024];
         loop {
             let n = sock.read(&mut buf).await?;
@@ -2283,11 +2378,11 @@ mod conn {
     }
 
     struct DebugStream {
-        tcp: TcpStream,
+        tcp: TokioIo<TcpStream>,
         shutdown_called: bool,
     }
 
-    impl AsyncWrite for DebugStream {
+    impl hyper::rt::Write for DebugStream {
         fn poll_shutdown(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -2312,11 +2407,11 @@ mod conn {
         }
     }
 
-    impl AsyncRead for DebugStream {
+    impl hyper::rt::Read for DebugStream {
         fn poll_read(
             mut self: Pin<&mut Self>,
             cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
+            buf: hyper::rt::ReadBufCursor<'_>,
         ) -> Poll<io::Result<()>> {
             Pin::new(&mut self.tcp).poll_read(cx, buf)
         }

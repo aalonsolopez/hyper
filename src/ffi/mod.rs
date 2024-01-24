@@ -25,7 +25,7 @@
 //! `cargo`, staring with `1.64.0`, it can be compiled with the following command:
 //!
 //! ```notrust
-//! RUSTFLAGS="--cfg hyper_unstable_ffi" cargo rustc --features client,http1,http2,ffi --crate-type cdylib
+//! RUSTFLAGS="--cfg hyper_unstable_ffi" cargo rustc --crate-type cdylib --features client,http1,http2,ffi
 //! ```
 
 // We may eventually allow the FFI to be enabled without `client` or `http1`,
@@ -76,6 +76,7 @@ pub const HYPER_HTTP_VERSION_1_1: libc::c_int = 11;
 /// The HTTP/2 version.
 pub const HYPER_HTTP_VERSION_2: libc::c_int = 20;
 
+#[derive(Clone)]
 struct UserDataPointer(*mut std::ffi::c_void);
 
 // We don't actually know anything about this pointer, it's up to the user
